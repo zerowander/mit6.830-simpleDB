@@ -129,11 +129,13 @@ public class LogFile {
         totalRecords++;
         if(recoveryUndecided){
             recoveryUndecided = false;
+            System.err.println("PREAPPEND TRUNCATE: file length before = " + raf.length());
             raf.seek(0);
             raf.setLength(0);
             raf.writeLong(NO_CHECKPOINT_ID);
             raf.seek(raf.length());
             currentOffset = raf.getFilePointer();
+            System.err.println("PREAPPEND TRUNCATE: file length after = " + raf.length() + ", currentOffset = " + currentOffset);
         }
     }
 
@@ -162,7 +164,11 @@ public class LogFile {
 
                 raf.writeInt(ABORT_RECORD);
                 raf.writeLong(tid.getId());
-                raf.writeLong(currentOffset);
+                long recordStart = raf.getFilePointer();
+
+                raf.writeInt(ABORT_RECORD);
+                raf.writeLong(tid.getId());
+                raf.writeLong(recordStart);
                 currentOffset = raf.getFilePointer();
                 force();
                 tidToFirstLogRecord.remove(tid.getId());
@@ -182,7 +188,11 @@ public class LogFile {
 
         raf.writeInt(COMMIT_RECORD);
         raf.writeLong(tid.getId());
-        raf.writeLong(currentOffset);
+        long recordStart = raf.getFilePointer();
+
+        raf.writeInt(COMMIT_RECORD);
+        raf.writeLong(tid.getId());
+        raf.writeLong(recordStart);
         currentOffset = raf.getFilePointer();
         force();
         tidToFirstLogRecord.remove(tid.getId());
@@ -201,21 +211,17 @@ public class LogFile {
         throws IOException  {
         Debug.log("WRITE, offset = " + raf.getFilePointer());
         preAppend();
-        /* update record conists of
+        long recordStart = raf.getFilePointer();
 
-           record type
-           transaction id
-           before page data (see writePageData)
-           after page data
-           start offset
-        */
         raf.writeInt(UPDATE_RECORD);
         raf.writeLong(tid.getId());
 
-        writePageData(raf,before);
-        writePageData(raf,after);
-        raf.writeLong(currentOffset);
+        writePageData(raf, before);
+        writePageData(raf, after);
+
+        raf.writeLong(recordStart);
         currentOffset = raf.getFilePointer();
+        System.err.println("logWrite tid=" + tid.getId() + " start=" + recordStart + " currentOffsetAfter=" + currentOffset);
 
         Debug.log("WRITE OFFSET = " + currentOffset);
     }
@@ -252,8 +258,10 @@ public class LogFile {
         PageId pid;
         Page newPage = null;
 
+        long pos = raf.getFilePointer();
         String pageClassName = raf.readUTF();
         String idClassName = raf.readUTF();
+        System.err.println("readPageData at " + pos + ": pageClass='" + pageClassName + "', idClass='" + idClassName + "'");
 
         try {
             Class<?> idClass = Class.forName(idClassName);
@@ -302,9 +310,15 @@ public class LogFile {
         preAppend();
         raf.writeInt(BEGIN_RECORD);
         raf.writeLong(tid.getId());
-        raf.writeLong(currentOffset);
+        long recordStart = raf.getFilePointer();
+
+        raf.writeInt(BEGIN_RECORD);
+        raf.writeLong(tid.getId());
+        raf.writeLong(recordStart);
+
         tidToFirstLogRecord.put(tid.getId(), currentOffset);
         currentOffset = raf.getFilePointer();
+        System.err.println("logXactionBegin tid=" + tid.getId() + " start=" + recordStart + " currentOffsetAfter=" + currentOffset);
 
         Debug.log("BEGIN OFFSET = " + currentOffset);
     }
@@ -459,7 +473,70 @@ public class LogFile {
         synchronized (Database.getBufferPool()) {
             synchronized(this) {
                 preAppend();
-                // some code goes here
+                
+                // Get the offset of the first log record for this transaction
+                Long startOffset = tidToFirstLogRecord.get(tid.getId());
+                if (startOffset == null) {
+                    return; // No log records for this transaction
+                }
+                
+                // Scan forward from the transaction's first record to find
+                // all UPDATE records. Keep only the first before-image for
+                // each page (the state before any modifications by this txn).
+                Map<PageId, Page> beforeImages = new LinkedHashMap<>();
+
+                // startOffset should point to the actual start of the
+                // BEGIN record. After logTruncate, it does. Before logTruncate,
+                // logXactionBegin stores start+12. Both cases work with the
+                // forward scan since the first [type][tid] is at startOffset.
+                raf.seek(startOffset);
+                while (true) {
+                    try {
+                        int type = raf.readInt();
+                        long recordTid = raf.readLong();
+
+                        if (type == UPDATE_RECORD && recordTid == tid.getId()) {
+                            Page before = readPageData(raf);
+                            Page after = readPageData(raf);
+                            PageId pid = before.getId();
+                            if (!beforeImages.containsKey(pid)) {
+                                beforeImages.put(pid, before);
+                            }
+                        } else if (type == UPDATE_RECORD) {
+                            readPageData(raf);
+                            readPageData(raf);
+                        } else if (type == CHECKPOINT_RECORD) {
+                            int count = raf.readInt();
+                            for (int i = 0; i < count; i++) {
+                                raf.readLong();
+                                raf.readLong();
+                            }
+                        } else {
+                            // BEGIN, COMMIT, ABORT: skip second [type][tid]
+                            raf.readInt();
+                            raf.readLong();
+                        }
+
+                        // Read trailing recordStart to position at next record
+                        raf.readLong();
+                    } catch (EOFException e) {
+                        break;
+                    }
+                }
+                
+                // Restore all the before images
+                for (Map.Entry<PageId, Page> entry : beforeImages.entrySet()) {
+                    PageId pid = entry.getKey();
+                    Page beforeImage = entry.getValue();
+                    
+                    // Write the before image back to the table file
+                    int tableId = pid.getTableId();
+                    DbFile file = Database.getCatalog().getDatabaseFile(tableId);
+                    file.writePage(beforeImage);
+                    
+                    // Discard the page from the buffer pool if it's there
+                    Database.getBufferPool().discardPage(pid);
+                }
             }
         }
     }
@@ -486,9 +563,177 @@ public class LogFile {
         synchronized (Database.getBufferPool()) {
             synchronized (this) {
                 recoveryUndecided = false;
-                // some code goes here
+
+                // Read the last checkpoint offset (first LONG in the file)
+                raf.seek(0);
+                long checkpointOffset = raf.readLong();
+                long startOffset = (checkpointOffset == NO_CHECKPOINT_ID) ? LONG_SIZE : checkpointOffset;
+
+                // Track transaction state and first log record offsets
+                Map<Long, Long> tidToFirstRecord = new HashMap<>();
+                Set<Long> committed = new HashSet<>();
+                Set<Long> aborted = new HashSet<>();
+
+                // Read checkpoint to get transactions active at checkpoint time
+                if (checkpointOffset != NO_CHECKPOINT_ID) {
+                    raf.seek(checkpointOffset);
+                    raf.readInt(); // CHECKPOINT_RECORD type
+                    raf.readLong(); // -1 placeholder tid
+                    int numOutstanding = raf.readInt();
+                    for (int i = 0; i < numOutstanding; i++) {
+                        long tid = raf.readLong();
+                        long firstRecord = raf.readLong();
+                        tidToFirstRecord.put(tid, firstRecord);
+                    }
+                }
+
+                // === Pass 1: Analysis ===
+                // Scan forward from checkpoint (or beginning) to determine
+                // which transactions committed, aborted, or remain active.
+                raf.seek(startOffset);
+                while (raf.getFilePointer() < raf.length()) {
+                    try {
+                        int type = raf.readInt();
+                        long tid = raf.readLong();
+
+                        switch (type) {
+                        case BEGIN_RECORD:
+                            if (!tidToFirstRecord.containsKey(tid)) {
+                                tidToFirstRecord.put(tid, raf.getFilePointer() - INT_SIZE - LONG_SIZE);
+                            }
+                            raf.readInt(); // skip second type
+                            raf.readLong(); // skip second tid
+                            break;
+                        case COMMIT_RECORD:
+                            committed.add(tid);
+                            raf.readInt(); // skip second type
+                            raf.readLong(); // skip second tid
+                            break;
+                        case ABORT_RECORD:
+                            aborted.add(tid);
+                            raf.readInt(); // skip second type
+                            raf.readLong(); // skip second tid
+                            break;
+                        case UPDATE_RECORD:
+                            readPageData(raf); // skip before-image
+                            readPageData(raf); // skip after-image
+                            break;
+                        case CHECKPOINT_RECORD:
+                            {
+                                int count = raf.readInt();
+                                for (int i = 0; i < count; i++) {
+                                    raf.readLong(); // tid
+                                    raf.readLong(); // first record offset
+                                }
+                            }
+                            break;
+                        }
+
+                        raf.readLong(); // record start marker
+
+                    } catch (EOFException e) {
+                        break;
+                    }
+                }
+
+                // === Pass 2: Redo committed transactions ===
+                // Apply after-images of committed transactions to ensure durability.
+                raf.seek(startOffset);
+                while (raf.getFilePointer() < raf.length()) {
+                    try {
+                        int type = raf.readInt();
+                        long tid = raf.readLong();
+
+                        if (type == UPDATE_RECORD) {
+                            Page before = readPageData(raf);
+                            Page after = readPageData(raf);
+                            if (committed.contains(tid)) {
+                                PageId pid = after.getId();
+                                DbFile file = Database.getCatalog().getDatabaseFile(pid.getTableId());
+                                file.writePage(after);
+                            }
+                        } else if (type == CHECKPOINT_RECORD) {
+                            int count = raf.readInt();
+                            for (int i = 0; i < count; i++) {
+                                raf.readLong();
+                                raf.readLong();
+                            }
+                        } else {
+                            // BEGIN, COMMIT, ABORT: skip second [type][tid]
+                            raf.readInt();
+                            raf.readLong();
+                        }
+
+                        raf.readLong(); // record start marker
+
+                    } catch (EOFException e) {
+                        break;
+                    }
+                }
+
+                // === Pass 3: Undo loser transactions ===
+                // Losers = active (no COMMIT, no ABORT). These were in-progress at crash.
+                List<Long> loserTids = new ArrayList<>();
+                for (Long tid : tidToFirstRecord.keySet()) {
+                    if (!committed.contains(tid) && !aborted.contains(tid)) {
+                        loserTids.add(tid);
+                    }
+                }
+                // Undo in reverse order of first record offset (most recent first)
+                loserTids.sort((a, b) -> Long.compare(tidToFirstRecord.get(b), tidToFirstRecord.get(a)));
+
+                for (Long loserTid : loserTids) {
+                    Long firstRecordOffset = tidToFirstRecord.get(loserTid);
+                    if (firstRecordOffset == null) continue;
+
+                    Map<PageId, Page> beforeImages = new LinkedHashMap<>();
+
+                    raf.seek(firstRecordOffset);
+                    while (raf.getFilePointer() < raf.length()) {
+                        try {
+                            int type = raf.readInt();
+                            long tid = raf.readLong();
+
+                            if (type == UPDATE_RECORD && tid == loserTid) {
+                                Page before = readPageData(raf);
+                                Page after = readPageData(raf);
+                                PageId pid = before.getId();
+                                if (!beforeImages.containsKey(pid)) {
+                                    beforeImages.put(pid, before);
+                                }
+                            } else if (type == UPDATE_RECORD) {
+                                readPageData(raf);
+                                readPageData(raf);
+                            } else if (type == CHECKPOINT_RECORD) {
+                                int count = raf.readInt();
+                                for (int i = 0; i < count; i++) {
+                                    raf.readLong();
+                                    raf.readLong();
+                                }
+                            } else {
+                                // BEGIN, COMMIT, ABORT
+                                raf.readInt();
+                                raf.readLong();
+                            }
+
+                            raf.readLong(); // record start marker
+
+                        } catch (EOFException e) {
+                            break;
+                        }
+                    }
+
+                    // Write before-images to disk and discard from buffer pool
+                    for (Map.Entry<PageId, Page> entry : beforeImages.entrySet()) {
+                        PageId pid = entry.getKey();
+                        Page beforeImage = entry.getValue();
+                        DbFile file = Database.getCatalog().getDatabaseFile(pid.getTableId());
+                        file.writePage(beforeImage);
+                        Database.getBufferPool().discardPage(pid);
+                    }
+                }
             }
-         }
+        }
     }
 
     /** Print out a human readable represenation of the log */

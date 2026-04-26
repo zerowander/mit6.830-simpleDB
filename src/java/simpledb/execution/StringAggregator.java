@@ -1,7 +1,9 @@
 package simpledb.execution;
 
 import simpledb.common.Type;
-import simpledb.storage.Tuple;
+import simpledb.storage.*;
+
+import java.util.*;
 
 /**
  * Knows how to compute some aggregate over a set of StringFields.
@@ -9,6 +11,14 @@ import simpledb.storage.Tuple;
 public class StringAggregator implements Aggregator {
 
     private static final long serialVersionUID = 1L;
+
+    private final int gbfield;
+    private final Type gbfieldtype;
+    private final int afield;
+    private final Op what;
+    
+    private final Map<Field, Integer> groupCounts;
+    private int noGroupingCount;
 
     /**
      * Aggregate constructor
@@ -20,7 +30,15 @@ public class StringAggregator implements Aggregator {
      */
 
     public StringAggregator(int gbfield, Type gbfieldtype, int afield, Op what) {
-        // some code goes here
+        if (what != Op.COUNT) {
+            throw new IllegalArgumentException("StringAggregator only supports COUNT");
+        }
+        this.gbfield = gbfield;
+        this.gbfieldtype = gbfieldtype;
+        this.afield = afield;
+        this.what = what;
+        this.groupCounts = new HashMap<>();
+        this.noGroupingCount = 0;
     }
 
     /**
@@ -28,7 +46,12 @@ public class StringAggregator implements Aggregator {
      * @param tup the Tuple containing an aggregate field and a group-by field
      */
     public void mergeTupleIntoGroup(Tuple tup) {
-        // some code goes here
+        if (gbfield == NO_GROUPING) {
+            noGroupingCount++;
+        } else {
+            Field groupField = tup.getField(gbfield);
+            groupCounts.put(groupField, groupCounts.getOrDefault(groupField, 0) + 1);
+        }
     }
 
     /**
@@ -40,8 +63,79 @@ public class StringAggregator implements Aggregator {
      *   aggregate specified in the constructor.
      */
     public OpIterator iterator() {
-        // some code goes here
-        throw new UnsupportedOperationException("please implement me for lab2");
+        List<Tuple> tuples = new ArrayList<>();
+        
+        if (gbfield == NO_GROUPING) {
+            // No grouping - return single tuple with count
+            TupleDesc td = new TupleDesc(new Type[] { Type.INT_TYPE });
+            Tuple t = new Tuple(td);
+            t.setField(0, new IntField(noGroupingCount));
+            tuples.add(t);
+        } else {
+            // Grouping - return tuples with (groupVal, count)
+            TupleDesc td = new TupleDesc(new Type[] { gbfieldtype, Type.INT_TYPE });
+            for (Map.Entry<Field, Integer> entry : groupCounts.entrySet()) {
+                Tuple t = new Tuple(td);
+                t.setField(0, entry.getKey());
+                t.setField(1, new IntField(entry.getValue()));
+                tuples.add(t);
+            }
+        }
+        
+        return new TupleIterator(getTupleDesc(), tuples);
+    }
+    
+    private TupleDesc getTupleDesc() {
+        if (gbfield == NO_GROUPING) {
+            return new TupleDesc(new Type[] { Type.INT_TYPE });
+        } else {
+            return new TupleDesc(new Type[] { gbfieldtype, Type.INT_TYPE });
+        }
+    }
+    
+    /**
+     * Helper class to iterate over tuples
+     */
+    private static class TupleIterator implements OpIterator {
+        private final TupleDesc td;
+        private final List<Tuple> tuples;
+        private int index;
+        private boolean open;
+        
+        public TupleIterator(TupleDesc td, List<Tuple> tuples) {
+            this.td = td;
+            this.tuples = tuples;
+            this.index = 0;
+            this.open = false;
+        }
+        
+        public void open() {
+            open = true;
+            index = 0;
+        }
+        
+        public boolean hasNext() {
+            return open && index < tuples.size();
+        }
+        
+        public Tuple next() throws NoSuchElementException {
+            if (!hasNext()) {
+                throw new NoSuchElementException();
+            }
+            return tuples.get(index++);
+        }
+        
+        public void rewind() {
+            index = 0;
+        }
+        
+        public TupleDesc getTupleDesc() {
+            return td;
+        }
+        
+        public void close() {
+            open = false;
+        }
     }
 
 }

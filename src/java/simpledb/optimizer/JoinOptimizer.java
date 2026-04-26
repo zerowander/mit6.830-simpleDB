@@ -126,11 +126,12 @@ public class JoinOptimizer {
             // You do not need to implement proper support for these for Lab 3.
             return card1 + cost1 + cost2;
         } else {
-            // Insert your code here.
-            // HINT: You may need to use the variable "j" if you implemented
-            // a join algorithm that's more complicated than a basic
-            // nested-loops join.
-            return -1.0;
+            // Nested loops join cost:
+            // IO cost: scancost(t1) + ntups(t1) * scancost(t2)
+            // CPU cost: ntups(t1) * ntups(t2)
+            double ioCost = cost1 + card1 * cost2;
+            double cpuCost = card1 * card2;
+            return ioCost + cpuCost;
         }
     }
 
@@ -174,9 +175,29 @@ public class JoinOptimizer {
                                                    String field2PureName, int card1, int card2, boolean t1pkey,
                                                    boolean t2pkey, Map<String, TableStats> stats,
                                                    Map<String, Integer> tableAliasToId) {
-        int card = 1;
-        // some code goes here
-        return card <= 0 ? 1 : card;
+        // Handle equality joins
+        if (joinOp == Predicate.Op.EQUALS) {
+            // If one side is a primary key, the join cardinality is at most the
+            // cardinality of the non-primary key side
+            if (t1pkey && !t2pkey) {
+                return card2;
+            } else if (t2pkey && !t1pkey) {
+                return card1;
+            } else if (t1pkey && t2pkey) {
+                // Both are primary keys - return the smaller one
+                return Math.min(card1, card2);
+            } else {
+                // Neither is a primary key - use a heuristic
+                // Assume selectivity of 1/Max(card1, card2)
+                return Math.max(card1, card2);
+            }
+        } else if (joinOp == Predicate.Op.NOT_EQUALS) {
+            // For not equals, return the size of the cross product minus the equal case
+            return card1 * card2 - Math.min(card1, card2);
+        } else {
+            // For range scans, use a fixed fraction of the cross product (30%)
+            return (int) (0.3 * card1 * card2);
+        }
     }
 
     /**
@@ -236,9 +257,48 @@ public class JoinOptimizer {
             Map<String, Double> filterSelectivities, boolean explain)
             throws ParsingException {
 
-        // some code goes here
-        //Replace the following
-        return joins;
+        // Selinger algorithm for optimal join ordering
+        PlanCache pc = new PlanCache();
+        
+        // Iterate over subset sizes from 1 to n
+        for (int size = 1; size <= joins.size(); size++) {
+            // Get all subsets of the given size
+            Set<Set<LogicalJoinNode>> subsets = enumerateSubsets(joins, size);
+            
+            for (Set<LogicalJoinNode> subset : subsets) {
+                double bestCost = Double.MAX_VALUE;
+                int bestCard = Integer.MAX_VALUE;
+                List<LogicalJoinNode> bestOrder = null;
+                
+                // Try each join as the last join in the plan
+                for (LogicalJoinNode joinToRemove : subset) {
+                    CostCard cc = computeCostAndCardOfSubplan(
+                            stats, filterSelectivities, joinToRemove, subset,
+                            bestCost, pc);
+                    
+                    if (cc != null && cc.cost < bestCost) {
+                        bestCost = cc.cost;
+                        bestCard = cc.card;
+                        bestOrder = cc.plan;
+                    }
+                }
+                
+                // Cache the best plan for this subset
+                if (bestOrder != null) {
+                    pc.addPlan(subset, bestCost, bestCard, bestOrder);
+                }
+            }
+        }
+        
+        // Get the best plan for all joins
+        Set<LogicalJoinNode> allJoins = new HashSet<>(joins);
+        List<LogicalJoinNode> bestPlan = pc.getOrder(allJoins);
+        
+        if (explain && bestPlan != null) {
+            printJoins(bestPlan, pc, stats, filterSelectivities);
+        }
+        
+        return bestPlan != null ? bestPlan : joins;
     }
 
     // ===================== Private Methods =================================
