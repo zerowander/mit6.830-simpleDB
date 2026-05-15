@@ -30,7 +30,7 @@ src/java/simpledb/
 ### Lab 1 — 存储层
 - **HeapPage**：定长页面，头部 bitmap 管理空闲槽位，元组顺序存放
 - **HeapFile**：页面集合，通过 `readPage`/`writePage` 读写磁盘
-- **BufferPool**：页面缓存（LRU 驱逐），提供 `getPage` 统一访问接口
+- **BufferPool**：页面缓存，缓存满时优先驱逐干净页并拒绝驱逐脏页，提供 `getPage` 统一访问接口
 - **Catalog**：维护表名 → DbFile 的映射
 
 ### Lab 2 — 查询执行
@@ -64,9 +64,9 @@ src/java/simpledb/
   1. **Analysis**：从 checkpoint 向前扫描，确定 winner/loser 集合
   2. **Redo**：重放已提交事务的 after-image
   3. **Undo**：按倒序撤销未提交事务的 before-image
-- 支持 checkpoint、STEAL/NO-FORCE 缓冲策略
+- 支持 checkpoint，并与当前 NO-STEAL/FORCE 缓冲策略配合：脏页不被驱逐，事务提交时刷盘
 
 ## 测试结果
 
-- 全部单元测试通过
-- 系统测试：LogTest 10/10，其余通过（BTreeTest.testBigFile 为并发压力测试已知问题）
+- 单元测试：`ant test`
+- 系统测试：`ant systemtest`

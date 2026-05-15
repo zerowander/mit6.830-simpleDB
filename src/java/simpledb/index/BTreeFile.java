@@ -456,6 +456,14 @@ public class BTreeFile implements DbFile {
 		}
 	}
 
+	private void markDirtyPages(Map<PageId, Page> dirtypages, TransactionId tid) {
+		// If a structural update fails mid-operation, abort must discard every page
+		// this transaction may have already mutated in memory.
+		for (Page page : dirtypages.values()) {
+			page.markDirty(true, tid);
+		}
+	}
+
 	/**
 	 * Insert a tuple into this BTreeFile, keeping the tuples in sorted order. 
 	 * May cause pages to split if the page where tuple t belongs is full.
@@ -470,27 +478,32 @@ public class BTreeFile implements DbFile {
 			throws DbException, IOException, TransactionAbortedException {
 		Map<PageId, Page> dirtypages = new HashMap<>();
 
-		// get a read lock on the root pointer page and use it to locate the root page
-		BTreeRootPtrPage rootPtr = getRootPtrPage(tid, dirtypages);
-		BTreePageId rootId = rootPtr.getRootId();
+		try {
+			// get a read lock on the root pointer page and use it to locate the root page
+			BTreeRootPtrPage rootPtr = getRootPtrPage(tid, dirtypages);
+			BTreePageId rootId = rootPtr.getRootId();
 
-		if(rootId == null) { // the root has just been created, so set the root pointer to point to it		
-			rootId = new BTreePageId(tableid, numPages(), BTreePageId.LEAF);
-			rootPtr = (BTreeRootPtrPage) getPage(tid, dirtypages, BTreeRootPtrPage.getId(tableid), Permissions.READ_WRITE);
-			rootPtr.setRootId(rootId);
+			if(rootId == null) { // the root has just been created, so set the root pointer to point to it
+				rootId = new BTreePageId(tableid, numPages(), BTreePageId.LEAF);
+				rootPtr = (BTreeRootPtrPage) getPage(tid, dirtypages, BTreeRootPtrPage.getId(tableid), Permissions.READ_WRITE);
+				rootPtr.setRootId(rootId);
+			}
+
+			// find and lock the left-most leaf page corresponding to the key field,
+			// and split the leaf page if there are no more slots available
+			BTreeLeafPage leafPage = findLeafPage(tid, dirtypages, rootId, Permissions.READ_WRITE, t.getField(keyField));
+			if(leafPage.getNumEmptySlots() == 0) {
+				leafPage = splitLeafPage(tid, dirtypages, leafPage, t.getField(keyField));
+			}
+
+			// insert the tuple into the leaf page
+			leafPage.insertTuple(t);
+
+			return new ArrayList<>(dirtypages.values());
+		} catch (DbException | IOException | TransactionAbortedException | RuntimeException e) {
+			markDirtyPages(dirtypages, tid);
+			throw e;
 		}
-
-		// find and lock the left-most leaf page corresponding to the key field,
-		// and split the leaf page if there are no more slots available
-		BTreeLeafPage leafPage = findLeafPage(tid, dirtypages, rootId, Permissions.READ_WRITE, t.getField(keyField));
-		if(leafPage.getNumEmptySlots() == 0) {
-			leafPage = splitLeafPage(tid, dirtypages, leafPage, t.getField(keyField));	
-		}
-
-		// insert the tuple into the leaf page
-		leafPage.insertTuple(t);
-
-        return new ArrayList<>(dirtypages.values());
 	}
 	
 	/**
@@ -952,19 +965,24 @@ public class BTreeFile implements DbFile {
 			throws DbException, IOException, TransactionAbortedException {
 		Map<PageId, Page> dirtypages = new HashMap<>();
 
-		BTreePageId pageId = new BTreePageId(tableid, t.getRecordId().getPageId().getPageNumber(),
-				BTreePageId.LEAF);
-		BTreeLeafPage page = (BTreeLeafPage) getPage(tid, dirtypages, pageId, Permissions.READ_WRITE);
-		page.deleteTuple(t);
+		try {
+			BTreePageId pageId = new BTreePageId(tableid, t.getRecordId().getPageId().getPageNumber(),
+					BTreePageId.LEAF);
+			BTreeLeafPage page = (BTreeLeafPage) getPage(tid, dirtypages, pageId, Permissions.READ_WRITE);
+			page.deleteTuple(t);
 
-		// if the page is below minimum occupancy, get some tuples from its siblings
-		// or merge with one of the siblings
-		int maxEmptySlots = page.getMaxTuples() - page.getMaxTuples()/2; // ceiling
-		if(page.getNumEmptySlots() > maxEmptySlots) { 
-			handleMinOccupancyPage(tid, dirtypages, page);
+			// if the page is below minimum occupancy, get some tuples from its siblings
+			// or merge with one of the siblings
+			int maxEmptySlots = page.getMaxTuples() - page.getMaxTuples()/2; // ceiling
+			if(page.getNumEmptySlots() > maxEmptySlots) {
+				handleMinOccupancyPage(tid, dirtypages, page);
+			}
+
+			return new ArrayList<>(dirtypages.values());
+		} catch (DbException | IOException | TransactionAbortedException | RuntimeException e) {
+			markDirtyPages(dirtypages, tid);
+			throw e;
 		}
-
-        return new ArrayList<>(dirtypages.values());
 	}
 
 	/**
